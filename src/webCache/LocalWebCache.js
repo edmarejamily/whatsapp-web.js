@@ -1,42 +1,67 @@
-const path = require('path');
 const fs = require('fs');
+const path = require('path');
 
-const { WebCache, VersionResolveError } = require('./WebCache');
-
-/**
- * LocalWebCache - Fetches a WhatsApp Web version from a local file store
- * @param {object} options - options
- * @param {string} options.path - Path to the directory where cached versions are saved, default is: "./.wwebjs_cache/" 
- * @param {boolean} options.strict - If true, will throw an error if the requested version can't be fetched. If false, will resolve to the latest version.
- */
-class LocalWebCache extends WebCache {
-    constructor(options = {}) {
-        super();
-
-        this.path = options.path || './.wwebjs_cache/';
-        this.strict = options.strict || false;
+class LocalWebCache {
+    constructor({ client, cachePath } = {}) {
+        this.client = client;
+        this.cachePath = cachePath || path.resolve(__dirname, '..', '.wwebjs_cache');
     }
 
-    async resolve(version) {
-        const filePath = path.join(this.path, `${version}.html`);
-        
-        try {
-            return fs.readFileSync(filePath, 'utf-8');
+    async persist(session) {
+        const base64ClientPage = await session.mPage.content();
+        const indexHtml = base64ClientPage;
+        const versionMatch = indexHtml.match(/manifest-([\d\\.]+)\.json/);
+        const version = versionMatch ? versionMatch[1] : 'default-version';
+
+        if (!fs.existsSync(this.cachePath)) {
+            fs.mkdirSync(this.cachePath, { recursive: true });
         }
-        catch (err) {
-            if (this.strict) throw new VersionResolveError(`Couldn't load version ${version} from the cache`);
-            return null;
-        }
+
+        fs.writeFileSync(path.join(this.cachePath, `index.html`), base64ClientPage);
+
+        const filePath = path.join(this.cachePath, `manifest-${version}.json`);
+        const manifest = await session.mPage.evaluate(() => {
+            return fetch(`manifest-${version}.json`).then(response => response.json());
+        });
+
+        fs.writeFileSync(filePath, JSON.stringify(manifest));
     }
 
-    async persist(indexHtml) {
-        // extract version from index (e.g. manifest-2.2206.9.json -> 2.2206.9)
-        const version = indexHtml.match(/manifest-([\d\\.]+)\.json/)[1];
-        if(!version) return;
-   
-        const filePath = path.join(this.path, `${version}.html`);
-        fs.mkdirSync(this.path, { recursive: true });
-        fs.writeFileSync(filePath, indexHtml);
+    async restore(session) {
+        if (!fs.existsSync(this.cachePath)) {
+            return;
+        }
+
+        const files = fs.readdirSync(this.cachePath);
+        const htmlFiles = files.filter(f => f.endsWith('.html'));
+
+        if (htmlFiles.length === 0) {
+            return;
+        }
+
+        const indexHtml = fs.readFileSync(path.join(this.cachePath, 'index.html')).toString();
+        await session.mPage.setContent(indexHtml);
+
+        const manifestFiles = files.filter(f => f.startsWith('manifest-') && f.endsWith('.json'));
+
+        for (const manifestFile of manifestFiles) {
+            const manifest = JSON.parse(fs.readFileSync(path.join(this.cachePath, manifestFile)));
+            await session.mPage.evaluateOnNewDocument((manifest, manifestFile) => {
+                window.navigator.serviceWorker.register = () => Promise.resolve({
+                    scope: '/',
+                    scriptURL: manifestFile
+                });
+                window.fetch = (resource) => {
+                    if (resource.endsWith('manifest.json')) {
+                        return Promise.resolve({
+                            json: () => manifest
+                        });
+                    } else {
+                        return fetch(resource);
+                    }
+                };
+            }, manifest, manifestFile);
+        }
     }
 }
 
